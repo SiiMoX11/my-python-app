@@ -2,6 +2,60 @@
 (() => {
 'use strict';
 
+// COMPTEUR POSTOPERATOIRE AUTOMATIQUE
+function postOpLabel(c) {
+  if (c.category !== 'Gestes faits') return String(c.content || '');
+  const dayNumber = value => {
+    const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return null;
+    const y=Number(match[1]), m=Number(match[2]), d=Number(match[3]);
+    const t=new Date(0);t.setUTCFullYear(y,m-1,d);t.setUTCHours(0,0,0,0);
+    if(t.getUTCFullYear()!==y || t.getUTCMonth()!==m-1 || t.getUTCDate()!==d)return null;
+    return t.getTime()/86400000;
+  };
+  const start=dayNumber(c.date), end=dayNumber(today());
+  if(start===null || end===null)return String(c.content || '') + ' — date du geste à renseigner';
+  if(end<start)return String(c.content || '') + ' — geste prévu le ' + fmtDate(c.date);
+  const text=String(c.content || '').replace(/^\s*J\s*\d+\s*(?:post\b\s*)?/i,'').replace(/^\s*post\b\s*/i,'').trim();
+  return 'J' + Math.round(end-start) + ' post ' + text;
+}
+function refreshPostOpLabels(){
+  if(!S.token || !S.entries)return;
+  document.querySelectorAll('[data-postop-id]').forEach(el=>{
+    const entry=(S.entries.clinique || []).find(c=>String(c.id)===el.dataset.postopId);
+    if(entry)el.textContent=postOpLabel(entry);
+  });
+}
+setInterval(refreshPostOpLabels,30000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshPostOpLabels();});
+
+
+async function downloadTableauWord() {
+  const button = document.querySelector('[data-act="tableau"]');
+  if (button) button.disabled = true;
+  try {
+    toast('Génération du tableau Word…');
+    const response = await fetch(API + '/api/tableau/word', {headers:{Authorization:'Bearer ' + S.token}, credentials:'same-origin'});
+    if (response.status === 401) {logout(true); throw new Error('Session expirée');}
+    if (!response.ok) {
+      let message = 'Impossible de générer le tableau';
+      try {message = (await response.json()).error || message;} catch {}
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    const match = (response.headers.get('Content-Disposition') || '').match(/filename="?([^";]+)"?/);
+    link.download = match ? match[1].trim() : 'Tableau_service.docx';
+    document.body.appendChild(link);link.click();link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    toast('Tableau Word téléchargé');
+  } catch (error) {toast(error.message, true);}
+  finally {if(button)button.disabled=false;}
+}
+
+
 // Base API : vide quand Flask sert le site ; remplacé par le proxy lors d'un déploiement de prévisualisation
 const API = '__PORT_8000__'.startsWith('__') ? '' : '__PORT_8000__';
 
@@ -14,7 +68,10 @@ const store = {
 // ------------------------------------------------------------------ utils
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const today = () => new Date().toISOString().slice(0, 10);
+let clock = {offset_minutes:0, epoch_ms:Date.now(), synced:performance.now()};
+const clockDate = () => new Date(clock.epoch_ms + performance.now()-clock.synced + clock.offset_minutes*60000);
+const today = () => clockDate().toISOString().slice(0,10);
+async function syncClock() {clock={...await api('/api/clock'), synced:performance.now()};}
 const fmtDate = (d) => { if (!d) return ''; const m = String(d).match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? `${m[3]}/${m[2]}/${m[1]}` : d; };
 const fmtTs = (t) => { if (!t) return ''; const [d, h] = t.split(' '); return `${fmtDate(d)} ${h ? h.slice(0, 5) : ''}`; };
 const bedLabel = (p) => p.room ? `${p.room}${p.position || ''}` : (p.hors_service ? 'Hors service' : '—');
@@ -59,7 +116,7 @@ const I = {
 // ------------------------------------------------------------------ auth
 function logout(silent) {
   if (S.token && !silent) api('/api/logout', { method: 'POST' }).catch(() => {});
-  S.token = null; S.user = null; store.set('cva_token', null);
+  S.token = null; S.user = null; S.meta = null; S.patient = null; S.entries = null; store.set('cva_token', null);
   closeModal(); location.hash = '#/login'; render();
 }
 
@@ -76,7 +133,7 @@ function viewLogin() {
         <button class="btn-login" type="submit">LOG IN</button>
       </form>
     </section>
-    <p class="login-hint">Prototype de démonstration — comptes test : <b>admin / admin123</b> · <b>dr.alami / medecin123</b> · <b>inf.sara / infirmier123</b></p>
+    
   </main>`;
   $('#login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -110,17 +167,18 @@ function topbar() {
   </header>
   <nav class="menu-panel" id="menu">
     <button data-go="#/home">Plan du service</button>
+    <button data-act="tableau">Tableau</button>
     <button data-act="admit">Admettre un patient</button>
     <button data-act="hs">Dossiers hors service</button>
     <button data-go="#/archives">Patients sortis (archives)</button>
-    ${S.user?.role === 'admin' ? '<div class="sep"></div><button data-go="#/users">Utilisateurs</button><button data-go="#/journal">Journal global</button>' : ''}
+    ${S.user?.role === 'admin' ? '<div class="sep"></div><button data-go="#/users">Utilisateurs</button><button data-go="#/journal">Journal global</button><button data-act="clock">Date et heure</button>' : ''}
     <div class="sep"></div>
-    <button data-act="logout">Se déconnecter</button>
+<button data-act="logout">Se déconnecter</button>
   </nav>`;
 }
 
 function bindChrome() {
-  const tick = () => { const c = $('#clock'); if (!c) return; const d = new Date(); c.textContent = `${d.toLocaleDateString('fr-FR')}   ${d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`; };
+  const tick = () => { const c = $('#clock'); if (!c) return; const d = clockDate(); c.textContent = `${d.toLocaleDateString('fr-FR',{timeZone:'UTC'})}   ${d.toLocaleTimeString('fr-FR', {timeZone:'UTC', hour:'2-digit', minute:'2-digit'})} UTC${clock.offset_minutes ? ' (corrigé)' : ''}`; };
   tick(); clearInterval(bindChrome._i); bindChrome._i = setInterval(tick, 15000);
   $('#logout-btn').onclick = () => logout();
   const menu = $('#menu');
@@ -135,6 +193,9 @@ function bindChrome() {
     if (b.dataset.act === 'admit') admitForm({});
     if (b.dataset.act === 'hs') openHorsService();
     if (b.dataset.act === 'logout') logout();
+    if (b.dataset.act === 'tableau') downloadTableauWord();
+    if (b.dataset.act === 'profile') profileForm();
+    if (b.dataset.act === 'clock') clockForm();
   });
   const inp = $('#search'), res = $('#search-res');
   let t;
@@ -330,7 +391,7 @@ const TABS = [['maj', 'MAJ'], ['obsrv', 'OBSRV'], ['ttt', 'TTT'], ['videos', 'VI
 const EXAM_TYPES = ['TDM', 'IRM', 'Bili-IRM', 'Échographie', 'Radiographie', 'Coloscopie', 'FOGD', 'Écho-endoscopie', 'CPRE', 'Anapath', 'Cytologie', 'Scintigraphie', 'Autre'];
 const CLIN_CATS = ['Gestes faits', 'Surveillance clinique', 'Constantes', 'Drains'];
 const ATCD_CATS = ['Médicaux', 'Chirurgicaux', 'Gynéco-obstétricaux', 'Toxiques', 'Allergies', 'Familiaux'];
-const SPECIALITES = ['Cardiologie', 'Gastro-entérologie', 'Pneumologie', 'Néphrologie', 'Endocrinologie', 'Anesthésie-Réanimation', 'Oncologie', 'Radiologie', 'Urologie', 'Gynécologie', 'Infectiologie', 'Hématologie'];
+const SPECIALITES = ['Anesthésie-Réanimation', 'Réanimation médicale', 'Réanimation chirurgicale', 'Médecine intensive', 'Médecine d’urgence', 'Médecine interne', 'Médecine générale', 'Cardiologie', 'Rythmologie', 'Cardiologie interventionnelle', 'Pneumologie', 'Gastro-entérologie', 'Hépatologie', 'Néphrologie', 'Endocrinologie', 'Diabétologie', 'Nutrition', 'Neurologie', 'Rhumatologie', 'Dermatologie', 'Allergologie', 'Immunologie clinique', 'Hématologie', 'Oncologie médicale', 'Radiothérapie', 'Maladies infectieuses', 'Gériatrie', 'Pédiatrie', 'Néonatologie', 'Psychiatrie', 'Pédopsychiatrie', 'Médecine physique et réadaptation', 'Médecine de la douleur', 'Soins palliatifs', 'Médecine du travail', 'Médecine du sport', 'Médecine légale', 'Santé publique', 'Chirurgie générale', 'Chirurgie viscérale et digestive', 'Chirurgie hépatobiliaire et pancréatique', 'Chirurgie colorectale', 'Chirurgie oncologique', 'Chirurgie thoracique', 'Chirurgie cardiovasculaire', 'Chirurgie vasculaire', 'Chirurgie orthopédique et traumatologique', 'Neurochirurgie', 'Chirurgie pédiatrique', 'Chirurgie plastique et reconstructrice', 'Chirurgie maxillo-faciale', 'Chirurgie orale', 'Urologie', 'Gynécologie-Obstétrique', 'Gynécologie', 'Obstétrique', 'Ophtalmologie', 'ORL', 'Radiologie', 'Radiologie interventionnelle', 'Médecine nucléaire', 'Anatomie et cytologie pathologiques', 'Biologie médicale', 'Microbiologie', 'Biochimie', 'Génétique médicale', 'Pharmacologie clinique', 'Autre'];
 
 async function loadPatient(id) {
   const r = await api('/api/patients/' + id);
@@ -389,7 +450,7 @@ async function refresh() {
 function renderConsignes() {
   const list = S.entries.consigne || [];
   const todo = list.filter(c => !c.done), done = list.filter(c => c.done);
-  const row = (c) => `<div class="cons ${c.done ? 'done' : 'todo'}"><input type="checkbox" data-id="${c.id}" ${c.done ? 'checked' : ''} aria-label="Valider la consigne"><span class="txt" data-edit="${c.id}">${esc(c.content)}<small>${esc(c.author)} · ${fmtTs(c.updated_at)}</small></span></div>`;
+  const row = (c) => `<div class="cons ${c.done ? 'done' : 'todo'}"><input type="checkbox" data-id="${c.id}" ${c.done ? 'checked' : ''} aria-label="Valider la consigne"><span class="txt" data-edit="${c.id}">${esc(c.content)}<small>${fmtDate(c.updated_at)}</small></span></div>`;
   $('#cons-list').innerHTML = (todo.map(row).join('') || '<div class="empty">Aucune consigne à faire</div>') + (done.length ? `<div class="cons-sep">VALIDÉES (${done.length})</div>` + done.map(row).join('') : '');
   $('#cons-list').querySelectorAll('input').forEach(i => i.onchange = async () => {
     await api('/api/entries/' + i.dataset.id, { method: 'PUT', body: { done: i.checked } });
@@ -462,18 +523,51 @@ function editIdentity() {
 const plusBtn = (kind, label) => `<button class="plus" data-add="${kind}" aria-label="Ajouter ${label}">${I.plus}</button>`;
 function bindItems(root) {
   root.querySelectorAll('[data-add]').forEach(b => b.onclick = (e) => { e.stopPropagation(); entryForm(b.dataset.add, null, b.dataset.preset ? JSON.parse(b.dataset.preset) : {}); });
-  root.querySelectorAll('[data-eid]').forEach(el => el.onclick = (e) => {
-    if (e.target.closest('.tog, a, video')) return;
-    const [kind, id] = el.dataset.eid.split(':');
-    entryForm(kind, S.entries[kind].find(x => String(x.id) === id));
+  const isMaj = ((location.hash.split('/')[3]) || 'maj') === 'maj';
+  root.querySelectorAll('[data-eid]').forEach(el => {
+    const edit = () => {
+      const [kind, id] = el.dataset.eid.split(':');
+      const item = (S.entries[kind] || []).find(x => String(x.id) === id);
+      if (item) entryForm(kind, item);
+    };
+    if (isMaj) {
+      el.onclick = null;
+      el.classList.add('maj-read-only');
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'maj-edit-pencil no-print';
+      button.textContent = '✎'; button.title = 'Modifier cet élément';
+      button.setAttribute('aria-label', 'Modifier cet élément');
+      button.onclick = event => {event.stopPropagation(); edit();};
+      el.prepend(button);
+    } else {
+      el.onclick = event => {
+        if (event.target.closest('.tog, a, video')) return;
+        edit();
+      };
+    }
   });
+  if (isMaj) {
+    const motif = root.querySelector('#motif-edit');
+    if (motif) {
+      motif.onclick = null;
+      motif.classList.add('maj-read-only');
+      const hint = motif.querySelector('small');
+      if (hint) hint.textContent = hint.textContent.replace(/\s*·\s*cliquer pour modifier/, '');
+      const button = document.createElement('button');
+      button.type = 'button';button.className = 'maj-edit-pencil no-print';
+      button.textContent = '✎';button.title = 'Modifier le motif';
+      button.setAttribute('aria-label','Modifier le motif');
+      button.onclick = event => {event.stopPropagation();editIdentity();};
+      motif.prepend(button);
+    }
+  }
   root.querySelectorAll('.tog').forEach(b => b.onclick = (e) => {
     e.stopPropagation();
     const id = b.dataset.tog; S.expanded.has(id) ? S.expanded.delete(id) : S.expanded.add(id);
     renderTab((location.hash.split('/')[3]) || 'maj');
   });
 }
-const meta = (e) => `<span class="meta">${esc(e.author)} · ${fmtTs(e.updated_at)}</span>`;
+const meta = (e) => `<span class="meta">${fmtDate(e.updated_at)}</span>`;
 const sortByDate = (arr) => [...arr].sort((a, b) => (b.date || '').localeCompare(a.date || '') || b.id - a.id);
 
 function examItem(e) {
@@ -491,17 +585,22 @@ function renderTab(tab) {
   const box = $('#tab-content'), E = S.entries, p = S.patient;
   if (tab === 'maj') {
     const atcds = E.atcd || [];
-    const atcdHtml = ATCD_CATS.map(c => { const l = atcds.filter(a => (a.category || 'Médicaux') === c); return l.length ? `<div class="atcd-cat">${c}</div>` + l.map(a => `<div class="item center" data-eid="atcd:${a.id}" style="border-bottom:none;padding:6px 14px">${esc(a.content)}</div>`).join('') : ''; }).join('');
-    const clin = sortByDate(E.clinique || []);
+    const atcdHtml = atcds.map(a => `<div class="item center" data-eid="atcd:${a.id}" style="border-bottom:none;padding:6px 14px">${esc(a.content)}</div>`).join('');
+    const clin = [...(E.clinique || [])].sort((a, b) => {
+      const rank = (e) => e.category === 'Gestes faits' ? 0 : e.category === 'Drains' ? 1 : 2;
+      return rank(a) - rank(b)
+        || (b.date || '').localeCompare(a.date || '')
+        || b.id - a.id;
+    });
     box.innerHTML = `<div class="cols">
-      <div class="col"><div class="col-head">${esc((p.motif || 'Motif').split(' - ')[0].slice(0, 26))} ${plusBtn('atcd', 'un antécédent')}</div>
+      <div class="col"><div class="col-head">Motif ${plusBtn('atcd', 'un antécédent')}</div>
         <div class="col-body">
           <div class="motif-block" id="motif-edit"><div class="m">${esc(p.motif || '—')}</div><small>Entrée le ${fmtDate(p.date_entree)} · cliquer pour modifier</small></div>
           <div class="atcd-cat" style="text-align:center;font-size:15px;text-transform:none;letter-spacing:0;color:var(--ink)">ATCDs :</div>
           ${atcdHtml || '<div class="empty">Aucun antécédent renseigné</div>'}
         </div></div>
       <div class="col"><div class="col-head">clinique ${plusBtn('clinique', 'un élément clinique')}</div>
-        <div class="col-body">${clin.map(c => `<div class="item center" data-eid="clinique:${c.id}"><span class="cat-tag">${esc(c.category)}</span><br>${esc(c.content)}<span class="meta">${fmtDate(c.date)} · ${esc(c.author)}</span></div>`).join('') || '<div class="empty">Gestes, surveillance, constantes, drains…</div>'}</div></div>
+        <div class="col-body">${clin.map(c => `<div class="item center" data-eid="clinique:${c.id}"><span class="cat-tag">${esc(c.category)}</span><br>${c.category === 'Gestes faits' ? `<span data-postop-id="${c.id}">${esc(postOpLabel(c))}</span>` : esc(c.content)}<span class="meta">${fmtDate(c.date)}</span></div>`).join('') || '<div class="empty">Gestes, surveillance, constantes, drains…</div>'}</div></div>
       <div class="col"><div class="col-head">Bilan ${plusBtn('bilan', 'un bilan')}</div>
         <div class="col-body">${sortByDate(E.bilan || []).map(b => `<div class="item" data-eid="bilan:${b.id}"><span class="k">${fmtDate(b.date)} :</span>\n${esc(b.content)}${meta(b)}</div>`).join('') || '<div class="empty">Aucun bilan</div>'}</div></div>
       <div class="col"><div class="col-head">Examen complémentaires ${plusBtn('examen', 'un examen')}</div>
@@ -512,7 +611,7 @@ function renderTab(tab) {
     $('#motif-edit').onclick = editIdentity;
   } else if (tab === 'obsrv') {
     box.innerHTML = `<div class="panel"><div class="panel-head"><h3>Observations médicales</h3><button class="btn primary" data-add="observation">+ Nouvelle observation</button></div>
-      <div class="timeline">${sortByDate(E.observation || []).map(o => `<article class="card" data-eid="observation:${o.id}"><h4>${fmtDate(o.date)}${o.title ? ' — ' + esc(o.title) : ''}</h4><p>${esc(o.content)}</p><div class="meta">${esc(o.author)} · modifié le ${fmtTs(o.updated_at)}</div></article>`).join('') || '<div class="empty">Aucune observation</div>'}</div></div>`;
+      <div class="timeline">${sortByDate(E.observation || []).map(o => `<article class="card" data-eid="observation:${o.id}"><h4>${fmtDate(o.date)}${o.title ? ' — ' + esc(o.title) : ''}</h4><p>${esc(o.content)}</p><div class="meta">${fmtDate(o.updated_at)}</div></article>`).join('') || '<div class="empty">Aucune observation</div>'}</div></div>`;
   } else if (tab === 'ttt') {
     const list = [...(E.traitement || [])].sort((a, b) => a.done - b.done || (b.date || '').localeCompare(a.date || ''));
     box.innerHTML = `<div class="panel"><div class="panel-head"><h3>Traitement</h3><button class="btn primary" data-add="traitement">+ Ajouter un traitement</button></div>
@@ -526,11 +625,11 @@ function renderTab(tab) {
       return yt ? `<iframe width="100%" height="200" src="https://www.youtube.com/embed/${yt[1]}" title="${esc(v.title)}" frameborder="0" allowfullscreen style="border-radius:10px"></iframe>` : `<a href="${esc(v.content)}" target="_blank" rel="noopener">Ouvrir la vidéo ↗</a>`;
     };
     box.innerHTML = `<div class="panel"><div class="panel-head"><h3>Vidéos opératoires & médias</h3><button class="btn primary" data-add="video">+ Ajouter une vidéo</button></div>
-      <div class="videos">${vids.map(v => `<article class="card" data-eid="video:${v.id}"><h4>${esc(v.title)}</h4>${media(v)}${v.details ? `<p style="margin-top:8px">${esc(v.details)}</p>` : ''}<div class="meta">${fmtDate(v.date)} · ${esc(v.author)}</div></article>`).join('') || '<div class="empty">Aucune vidéo</div>'}</div></div>`;
+      <div class="videos">${vids.map(v => `<article class="card" data-eid="video:${v.id}"><h4>${esc(v.title)}</h4>${media(v)}${v.details ? `<p style="margin-top:8px">${esc(v.details)}</p>` : ''}<div class="meta">${fmtDate(v.date)}</div></article>`).join('') || '<div class="empty">Aucune vidéo</div>'}</div></div>`;
   } else if (tab === 'anapath') {
     const ap = sortByDate((E.examen || []).filter(e => /anapath|cytolog/i.test(e.category)));
     box.innerHTML = `<div class="panel"><div class="panel-head"><h3>Anatomopathologie</h3><button class="btn primary" data-add="examen" data-preset='{"category":"Anapath"}'>+ Ajouter un résultat</button></div>
-      <div class="timeline">${ap.map(e => `<article class="card" data-eid="examen:${e.id}"><h4>${fmtDate(e.date)} — ${esc(e.title || e.category)}</h4><p><b>Conclusion :</b> ${esc(e.content)}</p>${e.details ? `<p style="margin-top:8px;color:var(--muted)">${esc(e.details)}</p>` : ''}<div class="meta">${esc(e.author)} · ${fmtTs(e.updated_at)}</div></article>`).join('') || '<div class="empty">Aucun résultat anapath (les examens de type « Anapath » apparaissent ici et dans la colonne Examens complémentaires).</div>'}</div></div>`;
+      <div class="timeline">${ap.map(e => `<article class="card" data-eid="examen:${e.id}"><h4>${fmtDate(e.date)} — ${esc(e.title || e.category)}</h4><p><b>Conclusion :</b> ${esc(e.content)}</p>${e.details ? `<p style="margin-top:8px;color:var(--muted)">${esc(e.details)}</p>` : ''}<div class="meta">${fmtDate(e.updated_at)}</div></article>`).join('') || '<div class="empty">Aucun résultat anapath (les examens de type « Anapath » apparaissent ici et dans la colonne Examens complémentaires).</div>'}</div></div>`;
   } else if (tab === 'sortie') {
     renderSortie(box); return;
   } else if (tab === 'logs') {
@@ -610,7 +709,12 @@ async function viewUsers() {
   $('#users').innerHTML = `<div class="panel-head"><h3>Utilisateurs de l'équipe</h3><button class="btn primary" id="add-user">+ Nouvel utilisateur</button></div>
     <table class="tbl"><thead><tr><th>Identifiant</th><th>Nom complet</th><th>Rôle</th><th>Statut</th><th></th></tr></thead>
     <tbody>${r.users.map(u => `<tr><td><b>${esc(u.username)}</b></td><td>${esc(u.full_name)}</td><td>${roles[u.role] || u.role}</td><td><span class="chip ${u.active ? 'on' : 'off'}">${u.active ? 'Actif' : 'Désactivé'}</span></td>
-      <td style="text-align:right"><button class="btn" data-pw="${u.id}">Mot de passe</button> <button class="btn ${u.active ? 'danger' : ''}" data-act="${u.id}" data-a="${u.active ? 0 : 1}">${u.active ? 'Désactiver' : 'Activer'}</button></td></tr>`).join('')}</tbody></table>`;
+      <td style="text-align:right"><button class="btn" data-pw="${u.id}">Mot de passe</button> ${u.role === 'admin' ? '<span class="chip on">Compte protégé</span>' : `<button class="btn ${u.active ? 'danger' : ''}" data-act="${u.id}" data-a="${u.active ? 0 : 1}">${u.active ? 'Désactiver' : 'Activer'}</button> <button class="btn danger" data-delete-user="${u.id}">Supprimer</button>`}</td></tr>`).join('')}</tbody></table>`;
+  document.querySelectorAll('[data-delete-user]').forEach(b=>b.onclick=async()=>{
+    const u=r.users.find(x=>String(x.id)===b.dataset.deleteUser);
+    if(!confirm(`Supprimer ${u.full_name} (${u.username}) ? Les dossiers et historiques seront conservés.`))return;
+    try{await api('/api/users/'+u.id,{method:'DELETE'});toast('Utilisateur supprimé');await viewUsers();}catch(e){toast(e.message,true);}
+  });
   $('#add-user').onclick = () => formModal({
     title: 'Nouvel utilisateur', submit: 'Créer',
     fields: [{ name: 'username', label: 'Identifiant', required: true }, { name: 'full_name', label: 'Nom complet', required: true }, { name: 'role', label: 'Rôle', type: 'select', options: [['medecin', 'Médecin'], ['infirmier', 'Infirmier(e)'], ['admin', 'Administrateur']] }, { name: 'password', label: 'Mot de passe', type: 'password', required: true }],
@@ -636,14 +740,40 @@ async function viewJournal() {
   $('#jr').querySelectorAll('tr[data-id]').forEach(tr => tr.onclick = () => (location.hash = `#/patient/${tr.dataset.id}/logs`));
 }
 
+
+function clockForm(){formModal({title:'UTC et adaptation manuelle',values:clock,
+ extra:'<p>UTC par défaut. Correction globale : 0 = UTC, +60 = UTC+1, -60 = UTC−1. Les anciens historiques ne sont pas modifiés.</p>',
+ fields:[{name:'offset_minutes',label:'Correction en minutes',type:'number',required:true}],
+ onSubmit:async v=>{await api('/api/clock',{method:'PUT',body:v});await syncClock();toast('Horloge mise à jour');setTimeout(render,0);}});}
+function profileFields(){return [
+ {name:'username',label:'Identifiant',required:true},{name:'full_name',label:'Nom complet',required:true},
+ {name:'current_password',label:'Mot de passe actuel / temporaire',type:'password',required:true},
+ ...(S.user.must_change_password ? [{name:'password',label:'Nouveau mot de passe (8 caractères minimum)',type:'password',required:true},{name:'confirm_password',label:'Confirmer le nouveau mot de passe',type:'password',required:true}] : [])
+];}
+async function saveProfile(v){
+ if(S.user.must_change_password && v.password!==v.confirm_password)throw new Error('Les mots de passe ne correspondent pas.');
+ delete v.confirm_password;
+ S.user=(await api('/api/me/profile',{method:'PUT',body:v})).user;
+ toast('Compte mis à jour');location.hash='#/home';setTimeout(render,0);
+}
+function profileForm(){formModal({title:'Mon compte',fields:profileFields(),values:S.user,
+ extra:'<p>Après la première connexion, seul l’administrateur peut modifier votre mot de passe.</p>',onSubmit:saveProfile});}
+function viewFirstLogin(){
+ $('#app').innerHTML=`<main class="login"><section class="login-card"><h1>Première connexion</h1><p>Personnalisez votre compte. Vous ne pourrez plus modifier vous-même votre mot de passe après cette étape.</p><form id="first-login">${profileFields().map(f=>`<label>${esc(f.label)}<input class="pill" name="${f.name}" type="${f.type||'text'}" value="${f.type==='password'?'':esc(S.user[f.name])}" required></label>`).join('')}<div class="login-err" id="first-error"></div><button class="btn primary" type="submit">Enregistrer et continuer</button><button class="btn" type="button" id="first-logout">Se déconnecter</button></form></section></main>`;
+ $('#first-logout').onclick=()=>logout();
+ $('#first-login').onsubmit=async e=>{e.preventDefault();try{await saveProfile(Object.fromEntries(new FormData(e.target)));}catch(err){$('#first-error').textContent=err.message;}};
+}
+
 // ------------------------------------------------------------------ router
 async function render() {
   const parts = (location.hash || '#/home').slice(2).split('/');
   if (!S.token) { if (parts[0] !== 'login') { location.hash = '#/login'; } viewLogin(); return; }
-  if (!S.meta) S.meta = await api('/api/meta');
   if (!S.user) { try { S.user = (await api('/api/me')).user; } catch { return; } }
   closeModal();
+  if (S.user.must_change_password) {viewFirstLogin(); return;}
   try {
+    await syncClock();
+    if (!S.meta) S.meta = await api('/api/meta');
     if (parts[0] === 'patient' && parts[1]) {
       const tab = TABS.some(t => t[0] === parts[2]) ? parts[2] : 'maj';
       if (!S.patient || String(S.patient.id) !== parts[1]) S.patient = null;

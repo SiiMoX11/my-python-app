@@ -115,13 +115,37 @@ CREATE INDEX IF NOT EXISTS idx_logs_patient ON logs(patient_id);
 """
 
 
+def platform_now():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        minutes = conn.execute("SELECT offset_minutes FROM clock_settings WHERE id=1").fetchone()[0]
+    finally:
+        conn.close()
+    return dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)
+
+
 def now():
-    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return platform_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db(seed=True):
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+    if "must_change_password" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+    if "initial_setup_pending" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN initial_setup_pending INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE users SET initial_setup_pending=must_change_password")
+    conn.execute("CREATE TABLE IF NOT EXISTS clock_settings (id INTEGER PRIMARY KEY CHECK(id=1), timezone TEXT NOT NULL DEFAULT 'UTC', offset_minutes INTEGER NOT NULL DEFAULT 0)")
+    conn.execute("INSERT OR IGNORE INTO clock_settings VALUES (1, 'UTC', 0)")
+    conn.execute("CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY)")
+    if not conn.execute("SELECT 1 FROM app_migrations WHERE name='utc_default_v2'").fetchone():
+        conn.execute("UPDATE clock_settings SET timezone='UTC', offset_minutes=0 WHERE id=1")
+        conn.execute("INSERT INTO app_migrations VALUES ('utc_default_v2')")
+    conn.execute("UPDATE users SET active=1 WHERE role='admin'")
+    conn.execute("UPDATE users SET must_change_password=initial_setup_pending")
+    conn.commit()
     if seed and conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         _seed(conn)
     conn.commit()
@@ -140,7 +164,7 @@ def _seed(conn):
             (u, n, r, generate_password_hash(p)),
         )
     t = now()
-    today = dt.date.today()
+    today = platform_now().date()
     d = lambda k: (today - dt.timedelta(days=k)).isoformat()
     demo = [
         # nom, prenom, age, ip, mutuelle, groupe, motif, room, pos, hors_service
@@ -241,6 +265,8 @@ def login_required(fn):
         if u is None:
             return jsonify(error="Session expirée, veuillez vous reconnecter."), 401
         g.user = u
+        if u["initial_setup_pending"] and request.endpoint not in {"api_me", "api_logout", "api_profile", "api_clock"}:
+            return jsonify(error="Personnalisez votre compte à la première connexion."), 403
         return fn(*a, **kw)
     return wrapper
 
@@ -263,7 +289,7 @@ def log(patient_id, action, detail=""):
 
 
 def user_public(u):
-    return {"id": u["id"], "username": u["username"], "full_name": u["full_name"], "role": u["role"]}
+    return {"id": u["id"], "username": u["username"], "full_name": u["full_name"], "role": u["role"], "must_change_password": bool(u["initial_setup_pending"])}
 
 
 @app.post("/api/login")
@@ -412,7 +438,7 @@ def api_create_patient():
         return jsonify(error="Nom et IP sont obligatoires."), 400
     if not p.get("room") and not p.get("hors_service"):
         return jsonify(error="Choisissez un lit ou un service d'hébergement."), 400
-    p.setdefault("date_entree", dt.date.today().isoformat())
+    p.setdefault("date_entree", platform_now().date().isoformat())
     cols = list(p.keys()) + ["created_at"]
     cur = db().execute(
         f"INSERT INTO patients({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
@@ -506,7 +532,7 @@ def api_readmit(pid):
         return jsonify(error="Choisissez un lit ou un service d'hébergement."), 400
     db().execute(
         "UPDATE patients SET status='hospitalise', room=?, position=?, hors_service=?, date_entree=? WHERE id=?",
-        (p.get("room"), p.get("position"), p.get("hors_service"), dt.date.today().isoformat(), pid),
+        (p.get("room"), p.get("position"), p.get("hors_service"), platform_now().date().isoformat(), pid),
     )
     log(pid, "Réadmission", f"{p.get('room') or ''}{p.get('position') or ''} {p.get('hors_service') or ''}".strip())
     db().commit()
@@ -614,7 +640,7 @@ def api_upload(pid):
     f.save(os.path.join(UPLOAD_DIR, name))
     t = now()
     title = request.form.get("title") or f.filename
-    date = request.form.get("date") or dt.date.today().isoformat()
+    date = request.form.get("date") or platform_now().date().isoformat()
     db().execute(
         """INSERT INTO entries(patient_id, kind, category, date, title, content, details, done, author,
            created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
@@ -668,7 +694,7 @@ def api_add_user():
         return jsonify(error="Rôle invalide."), 400
     try:
         db().execute(
-            "INSERT INTO users(username, full_name, role, password_hash) VALUES (?,?,?,?)",
+            "INSERT INTO users(username, full_name, role, password_hash, must_change_password, initial_setup_pending) VALUES (?,?,?,?,1,1)",
             (username, d["full_name"].strip(), d["role"], generate_password_hash(d["password"])),
         )
     except sqlite3.IntegrityError:
@@ -682,22 +708,97 @@ def api_add_user():
 @admin_required
 def api_update_user(uid):
     d = request.get_json(silent=True) or {}
+    db().execute("BEGIN IMMEDIATE")
+    u = db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        return jsonify(error="Utilisateur introuvable."), 404
+    if u["role"] == "admin" and "active" in d and not d["active"]:
+        return jsonify(error="Impossible de désactiver un compte administrateur."), 403
+    if u["role"] == "admin" and "role" in d and d["role"] != "admin":
+        return jsonify(error="Le rôle administrateur est protégé contre la rétrogradation."), 403
     sets, args = [], []
     if d.get("password"):
-        sets.append("password_hash = ?"); args.append(generate_password_hash(d["password"]))
+        if len(d["password"]) < 8:
+            return jsonify(error="Le mot de passe doit contenir au moins 8 caractères."), 400
+        sets.append("password_hash=?"); args.append(generate_password_hash(d["password"]))
+        db().execute("DELETE FROM tokens WHERE user_id=?", (uid,))
     if "active" in d:
-        if uid == g.user["id"] and not d["active"]:
-            return jsonify(error="Vous ne pouvez pas désactiver votre propre compte."), 400
-        sets.append("active = ?"); args.append(1 if d["active"] else 0)
+        sets.append("active=?"); args.append(1 if d["active"] else 0)
         if not d["active"]:
-            db().execute("DELETE FROM tokens WHERE user_id = ?", (uid,))
+            db().execute("DELETE FROM tokens WHERE user_id=?", (uid,))
     if d.get("role") in ("admin", "medecin", "infirmier"):
-        sets.append("role = ?"); args.append(d["role"])
+        sets.append("role=?"); args.append(d["role"])
     if sets:
-        db().execute(f"UPDATE users SET {', '.join(sets)} WHERE id = ?", [*args, uid])
+        db().execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", [*args, uid])
         log(None, "Utilisateur modifié", f"id {uid}")
-        db().commit()
+    db().commit()
     return jsonify(ok=True)
+
+
+@app.delete("/api/users/<int:uid>")
+@admin_required
+def api_delete_user(uid):
+    db().execute("BEGIN IMMEDIATE")
+    u = db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        return jsonify(error="Utilisateur introuvable."), 404
+    if u["role"] == "admin":
+        return jsonify(error="Impossible de supprimer un compte administrateur."), 403
+    db().execute("DELETE FROM users WHERE id=?", (uid,))
+    log(None, "Utilisateur supprimé", f"{u['username']} — {u['full_name']} (id {uid})")
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/clock")
+@login_required
+def api_clock():
+    row = db().execute("SELECT offset_minutes FROM clock_settings WHERE id=1").fetchone()
+    return jsonify(timezone="UTC", offset_minutes=row[0], epoch_ms=dt.datetime.now(dt.timezone.utc).timestamp()*1000)
+
+
+@app.put("/api/clock")
+@admin_required
+def api_set_clock():
+    d = request.get_json(silent=True) or {}
+    try:
+        offset = int(d.get("offset_minutes", 0))
+        if not -1440 <= offset <= 1440:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify(error="Correction invalide : -1440 à 1440 minutes."), 400
+    db().execute("UPDATE clock_settings SET timezone='UTC', offset_minutes=? WHERE id=1", (offset,))
+    db().commit()
+    log(None, "Réglage de l'horloge UTC", f"Correction {offset} minutes")
+    db().commit()
+    return api_clock()
+
+
+@app.put("/api/me/profile")
+@login_required
+def api_profile():
+    d = request.get_json(silent=True) or {}
+    if not check_password_hash(g.user["password_hash"], d.get("current_password") or ""):
+        return jsonify(error="Mot de passe actuel incorrect."), 400
+    password = d.get("password") or ""
+    if password and not g.user["initial_setup_pending"]:
+        return jsonify(error="Après la première connexion, seul l'administrateur peut modifier votre mot de passe."), 403
+    if g.user["initial_setup_pending"] and (len(password)<8 or check_password_hash(g.user["password_hash"], password)):
+        return jsonify(error="Choisissez un mot de passe différent de 8 caractères minimum."), 400
+    username = str(d.get("username", g.user["username"])).strip().lower()
+    name = str(d.get("full_name", g.user["full_name"])).strip()
+    if not username or not name or len(username)>80 or len(name)>160:
+        return jsonify(error="Identifiant et nom complet valides obligatoires."), 400
+    try:
+        db().execute("UPDATE users SET username=?, full_name=?, password_hash=?, must_change_password=0, initial_setup_pending=0 WHERE id=?",
+                     (username, name, generate_password_hash(password) if password else g.user["password_hash"], g.user["id"]))
+    except sqlite3.IntegrityError:
+        return jsonify(error="Cet identifiant existe déjà."), 400
+    token = request.headers.get("Authorization", "")[7:]
+    db().execute("DELETE FROM tokens WHERE user_id=? AND token<>?", (g.user["id"], token))
+    log(None, "Compte personnalisé", f"id {g.user['id']} : {username}")
+    db().commit()
+    return jsonify(user=user_public(db().execute("SELECT * FROM users WHERE id=?", (g.user["id"],)).fetchone()))
 
 
 # ---------------------------------------------------------------- Front-end
@@ -712,6 +813,10 @@ def no_cache_api(resp):
         resp.headers["Cache-Control"] = "no-store"
     return resp
 
+
+# EXTENSION TABLEAU WORD
+from tableau_word import register_tableau
+register_tableau(app, db, login_required, now)
 
 init_db()
 

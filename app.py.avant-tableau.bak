@@ -1,0 +1,820 @@
+"""
+Chirurgie Viscérale A - CHU Oujda
+Plateforme de gestion des patients du service (prototype).
+
+Backend : Python 3 + Flask + SQLite
+Lancement local :  python app.py   (http://localhost:8000)
+Production       :  gunicorn -w 2 -b 0.0.0.0:8000 app:app
+"""
+import os
+import sqlite3
+import secrets
+import datetime as dt
+from functools import wraps
+
+from flask import Flask, g, jsonify, request, send_from_directory, abort
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("CVA_DB", os.path.join(BASE_DIR, "cva.db"))
+UPLOAD_DIR = os.environ.get("CVA_UPLOADS", os.path.join(BASE_DIR, "uploads"))
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Plan du service (vue de haut) : utilisé par le front et pour valider les chambres
+ROOMS = [str(n) for n in range(201, 219)]
+POSITIONS = ["F", "P"]  # F = côté fenêtre, P = côté porte
+MUTUELLES = ["CNSS", "CNOPS", "AMO", "RAMED", "FAR", "Assurance privée", "Payant"]
+GROUPES = ["O+", "O-", "A+", "A-", "B+", "B-", "AB+", "AB-", "Inconnu"]
+ENTRY_KINDS = {
+    "consigne", "atcd", "clinique", "bilan", "examen", "avis",
+    "observation", "traitement", "video",
+}
+KIND_LABEL = {
+    "consigne": "Consigne", "atcd": "Antécédent", "clinique": "Clinique",
+    "bilan": "Bilan", "examen": "Examen complémentaire", "avis": "Avis spécialisé",
+    "observation": "Observation", "traitement": "Traitement", "video": "Vidéo",
+}
+
+app = Flask(__name__, static_folder="static", static_url_path="/static")
+app.config["MAX_CONTENT_LENGTH"] = 300 * 1024 * 1024  # 300 Mo (vidéos)
+
+
+# --------------------------------------------------------------------------- DB
+def db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_exc):
+    conn = g.pop("db", None)
+    if conn is not None:
+        conn.close()
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    full_name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'medecin',   -- admin | medecin | infirmier
+    password_hash TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS tokens (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS patients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nom TEXT NOT NULL,
+    prenom TEXT NOT NULL DEFAULT '',
+    age INTEGER,
+    ip TEXT NOT NULL,
+    mutuelle TEXT DEFAULT '',
+    groupe TEXT DEFAULT '',
+    motif TEXT DEFAULT '',
+    room TEXT,                 -- 201..218 ou NULL si hors service
+    position TEXT,             -- F | P
+    hors_service TEXT,         -- ex. 'Service Réanimation Brûlés BOX 2'
+    status TEXT NOT NULL DEFAULT 'hospitalise',  -- hospitalise | sorti
+    date_entree TEXT,
+    sortie_date TEXT, sortie_mode TEXT, sortie_destination TEXT,
+    sortie_resume TEXT, sortie_ordonnance TEXT, sortie_rdv TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_id INTEGER NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    category TEXT DEFAULT '',   -- type d'examen, catégorie clinique, spécialité...
+    date TEXT DEFAULT '',
+    title TEXT DEFAULT '',
+    content TEXT DEFAULT '',
+    details TEXT DEFAULT '',
+    done INTEGER NOT NULL DEFAULT 0,
+    author TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_id INTEGER,
+    user TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT DEFAULT '',
+    ts TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_entries_patient ON entries(patient_id, kind);
+CREATE INDEX IF NOT EXISTS idx_logs_patient ON logs(patient_id);
+"""
+
+
+def platform_now():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        minutes = conn.execute("SELECT offset_minutes FROM clock_settings WHERE id=1").fetchone()[0]
+    finally:
+        conn.close()
+    return dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)
+
+
+def now():
+    return platform_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def init_db(seed=True):
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(SCHEMA)
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(users)")}
+    if "must_change_password" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+    if "initial_setup_pending" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN initial_setup_pending INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE users SET initial_setup_pending=must_change_password")
+    conn.execute("CREATE TABLE IF NOT EXISTS clock_settings (id INTEGER PRIMARY KEY CHECK(id=1), timezone TEXT NOT NULL DEFAULT 'UTC', offset_minutes INTEGER NOT NULL DEFAULT 0)")
+    conn.execute("INSERT OR IGNORE INTO clock_settings VALUES (1, 'UTC', 0)")
+    conn.execute("CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY)")
+    if not conn.execute("SELECT 1 FROM app_migrations WHERE name='utc_default_v2'").fetchone():
+        conn.execute("UPDATE clock_settings SET timezone='UTC', offset_minutes=0 WHERE id=1")
+        conn.execute("INSERT INTO app_migrations VALUES ('utc_default_v2')")
+    conn.execute("UPDATE users SET active=1 WHERE role='admin'")
+    conn.execute("UPDATE users SET must_change_password=initial_setup_pending")
+    conn.commit()
+    if seed and conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        _seed(conn)
+    conn.commit()
+    conn.close()
+
+
+def _seed(conn):
+    users = [
+        ("admin", "Administrateur", "admin", "admin123"),
+        ("dr.alami", "Dr Alami", "medecin", "medecin123"),
+        ("inf.sara", "Sara (IDE)", "infirmier", "infirmier123"),
+    ]
+    for u, n, r, p in users:
+        conn.execute(
+            "INSERT INTO users(username, full_name, role, password_hash) VALUES (?,?,?,?)",
+            (u, n, r, generate_password_hash(p)),
+        )
+    t = now()
+    today = platform_now().date()
+    d = lambda k: (today - dt.timedelta(days=k)).isoformat()
+    demo = [
+        # nom, prenom, age, ip, mutuelle, groupe, motif, room, pos, hors_service
+        ("BENALI", "Ahmed", 65, "12345678", "CNSS", "O+", "AVP - Traumatisme abdominal", "203", "F", None),
+        ("EL AMRANI", "Fatima", 52, "87654321", "CNOPS", "A+", "Cholécystectomie", "203", "P", None),
+        ("OUAZZANI", "Karim", 41, "23423411", "AMO", "B+", "Appendicectomie", "201", "F", None),
+        ("TAHIRI", "Nadia", 58, "34534522", "Payant", "O-", "Occlusion intestinale", "202", "F", None),
+        ("BERRADA", "Youssef", 70, "45645633", "CNSS", "A-", "Cancer colique droit", "202", "P", None),
+        ("CHERKAOUI", "Salma", 36, "56756744", "AMO", "AB+", "Kyste hydatique du foie", "204", "F", None),
+        ("IDRISSI", "Omar", 47, "67867855", "CNOPS", "O+", "Hernie inguinale étranglée", "205", "P", None),
+        ("FASSI", "Hind", 29, "78978966", "AMO", "B-", "Péritonite appendiculaire", "206", "F", None),
+        ("SAIDI", "Mustapha", 63, "89089077", "CNSS", "A+", "Ictère obstructif", "208", "F", None),
+        ("LAHLOU", "Rachid", 55, "90190188", "Payant", "O+", "Sigmoïdite", "208", "P", None),
+        ("ZIANI", "Amina", 44, "11211299", "AMO", "A+", "Lithiase vésiculaire", "209", "F", None),
+        ("RAMI", "Hassan", 68, "22322300", "CNOPS", "B+", "Cancer gastrique", "211", "P", None),
+        ("NACIRI", "Leila", 39, "33433411", "AMO", "O+", "Éventration", "212", "F", None),
+        ("MOUSSAOUI", "Driss", 50, "44544522", "CNSS", "AB-", "Fistule anale", "215", "F", None),
+        ("KADIRI", "Imane", 33, "55655633", "AMO", "A-", "Pancréatite aiguë", "217", "P", None),
+        ("HAMDI", "Ali", 61, "66766744", "CNSS", "O+", "Brûlure abdominale + éviscération", None, None, "Service Réanimation Brûlés BOX 2"),
+        ("SEBTI", "Khadija", 57, "77877855", "CNOPS", "A+", "Angiocholite", None, None, "Service HGE"),
+        ("AMRANI", "Said", 72, "88988966", "Payant", "B+", "Ischémie mésentérique", None, None, "Réanimation chirurgicale lit 4"),
+    ]
+    for i, p in enumerate(demo):
+        cur = conn.execute(
+            """INSERT INTO patients(nom, prenom, age, ip, mutuelle, groupe, motif, room, position,
+               hors_service, date_entree, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (*p, d(3 + i % 6), t),
+        )
+        pid = cur.lastrowid
+        conn.execute(
+            "INSERT INTO logs(patient_id, user, action, detail, ts) VALUES (?,?,?,?,?)",
+            (pid, "admin", "Création du dossier", f"{p[0]} {p[1]} - IP {p[3]}", t),
+        )
+
+    def e(pid, kind, category="", date="", title="", content="", details="", done=0):
+        conn.execute(
+            """INSERT INTO entries(patient_id, kind, category, date, title, content, details, done,
+               author, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (pid, kind, category, date, title, content, details, done, "Dr Alami", t, t),
+        )
+
+    # Dossier complet de démonstration : BENALI Ahmed (id 1)
+    for c in ["Demander bilan", "Relecture TDM", "Arrêter Lovenox", "Prévu pour écho-endoscopie", "Ajouter Genta"]:
+        e(1, "consigne", content=c.upper())
+    for c in ["Récupérer bilan", "Récupérer CR TDM", "Récupérer avis cardio", "Récupérer avis gastro",
+              "Demander TDM", "Demander avis cardio", "Demander avis gastro"]:
+        e(1, "consigne", content=c.upper(), done=1)
+    e(1, "atcd", category="Médicaux", content="HTA sous Amlodipine 5 mg/j")
+    e(1, "atcd", category="Médicaux", content="Diabète type 2 sous ADO")
+    e(1, "atcd", category="Chirurgicaux", content="Appendicectomie en 1998")
+    e(1, "atcd", category="Toxiques", content="Tabagisme sevré depuis 10 ans")
+    e(1, "clinique", category="Constantes", date=d(0), content="TA 13/8 - FC 88 bpm - T° 37.8 °C - SpO2 97 % AA")
+    e(1, "clinique", category="Surveillance clinique", date=d(0), content="Abdomen souple, sensibilité de la FID, transit repris (gaz +)")
+    e(1, "clinique", category="Drains", date=d(0), content="Drain sous-hépatique : 80 cc séro-hématique")
+    e(1, "clinique", category="Gestes faits", date=d(1), content="Pose de sonde urinaire + VVP")
+    e(1, "bilan", date=d(0), content="Alb : 34\nGB : 6660\nHB : 13.1\nPlq : 196k\nTP : 74\nCRP : 40\nBT/BD : 17/10\nGGT/PAL : 59/177\nASAT/ALAT : 47/25\nUrée/Créat : 0.41/6.9\nNa/K : 137/3.9")
+    e(1, "bilan", date=d(2), content="Alb : 31\nGB : 11200\nHB : 12.4\nTP : 70\nCRP : 120\nUrée/Créat : 0.45/7.2\nNa/K : 135/3.6")
+    e(1, "examen", category="TDM", date=d(2), title="TDM TAP", details="Lieu : CHU Oujda\nTechnique : acquisition hélicoïdale avec injection.\nRésultat : épanchement péri-hépatique de faible abondance, pas de pneumopéritoine, contusion hépatique segment VI.",
+      content="Contusion hépatique segment VI, épanchement de faible abondance. Pas de lésion d'organe creux.")
+    e(1, "examen", category="Bili-IRM", date=d(1), title="Bili-IRM", details="Lieu : CHU Oujda\nVoie biliaire principale 9 mm, micro-calcul du bas cholédoque de 4 mm.\nPas de dilatation des VBIH.",
+      content="Micro-lithiase du bas cholédoque (4 mm), VBP à 9 mm.")
+    e(1, "examen", category="Anapath", date=d(0), title="Anapath pièce d'appendicectomie", details="N° prélèvement : AP-2026-1182\nMacroscopie : appendice de 7 cm.\nMicroscopie : infiltrat inflammatoire transmural à PNN.",
+      content="Appendicite aiguë phlegmoneuse. Absence de malignité.")
+    e(1, "avis", category="Cardiologie", date=d(1), content="Pas de contre-indication cardiologique à la chirurgie. ETT : FEVG 60 %.")
+    e(1, "avis", category="Gastro-entérologie", date=d(0), content="Indication de CPRE avec sphinctérotomie, à programmer après bilan d'hémostase.")
+    e(1, "observation", date=d(0), content="Patient conscient, apyrétique, douleur bien contrôlée (EVA 2/10). Reprise de l'alimentation liquide.")
+    e(1, "observation", date=d(1), content="J1 post-op : bonne évolution, drain productif 150 cc, mobilisation au fauteuil.")
+    e(1, "traitement", date=d(2), title="Ceftriaxone", content="2 g/j IV", category="Antibiotique")
+    e(1, "traitement", date=d(2), title="Métronidazole", content="500 mg x3/j IV", category="Antibiotique")
+    e(1, "traitement", date=d(2), title="Paracétamol", content="1 g x4/j IV", category="Antalgique")
+    e(1, "traitement", date=d(3), title="Lovenox", content="4000 UI/j SC", category="Anticoagulant", done=1)
+    e(2, "consigne", content="PRÉPARER BLOC DEMAIN")
+    e(2, "consigne", content="BILAN PRÉ-OPÉRATOIRE", done=1)
+    e(2, "bilan", date=d(0), content="GB : 8400\nHB : 12.9\nPlq : 250k\nTP : 90")
+    e(2, "examen", category="Échographie", date=d(1), title="Échographie abdominale", content="Vésicule lithiasique, paroi fine, VBP non dilatée.")
+    for pid in range(3, 19):
+        e(pid, "consigne", content="SURVEILLANCE CONSTANTES")
+        e(pid, "bilan", date=d(0), content="GB : 9000\nHB : 12.0\nCRP : 25")
+
+
+# ----------------------------------------------------------------------- Auth
+def current_user():
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else request.args.get("t", "")
+    if not token:
+        return None
+    row = db().execute(
+        "SELECT u.* FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.token = ? AND u.active = 1",
+        (token,),
+    ).fetchone()
+    return row
+
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        u = current_user()
+        if u is None:
+            return jsonify(error="Session expirée, veuillez vous reconnecter."), 401
+        g.user = u
+        if u["initial_setup_pending"] and request.endpoint not in {"api_me", "api_logout", "api_profile", "api_clock"}:
+            return jsonify(error="Personnalisez votre compte à la première connexion."), 403
+        return fn(*a, **kw)
+    return wrapper
+
+
+def admin_required(fn):
+    @wraps(fn)
+    @login_required
+    def wrapper(*a, **kw):
+        if g.user["role"] != "admin":
+            return jsonify(error="Réservé à l'administrateur."), 403
+        return fn(*a, **kw)
+    return wrapper
+
+
+def log(patient_id, action, detail=""):
+    db().execute(
+        "INSERT INTO logs(patient_id, user, action, detail, ts) VALUES (?,?,?,?,?)",
+        (patient_id, g.user["full_name"], action, detail[:500], now()),
+    )
+
+
+def user_public(u):
+    return {"id": u["id"], "username": u["username"], "full_name": u["full_name"], "role": u["role"], "must_change_password": bool(u["initial_setup_pending"])}
+
+
+@app.post("/api/login")
+def api_login():
+    data = request.get_json(silent=True) or {}
+    u = db().execute(
+        "SELECT * FROM users WHERE username = ? AND active = 1", ((data.get("username") or "").strip().lower(),)
+    ).fetchone()
+    if not u or not check_password_hash(u["password_hash"], data.get("password") or ""):
+        return jsonify(error="Nom d'utilisateur ou mot de passe incorrect."), 401
+    token = secrets.token_urlsafe(32)
+    db().execute("INSERT INTO tokens(token, user_id, created_at) VALUES (?,?,?)", (token, u["id"], now()))
+    db().commit()
+    return jsonify(token=token, user=user_public(u))
+
+
+@app.post("/api/logout")
+@login_required
+def api_logout():
+    auth = request.headers.get("Authorization", "")
+    db().execute("DELETE FROM tokens WHERE token = ?", (auth[7:],))
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/me")
+@login_required
+def api_me():
+    return jsonify(user=user_public(g.user))
+
+
+@app.get("/api/meta")
+def api_meta():
+    return jsonify(rooms=ROOMS, positions=POSITIONS, mutuelles=MUTUELLES, groupes=GROUPES)
+
+
+# ------------------------------------------------------------------- Patients
+def patient_dict(r):
+    return dict(r) if r else None
+
+
+def bed_taken(room, position, exclude_id=None):
+    q = "SELECT id FROM patients WHERE status='hospitalise' AND room=? AND position=?"
+    args = [room, position]
+    if exclude_id:
+        q += " AND id != ?"
+        args.append(exclude_id)
+    return db().execute(q, args).fetchone() is not None
+
+
+@app.get("/api/rooms")
+@login_required
+def api_rooms():
+    rows = db().execute(
+        "SELECT id, nom, prenom, ip, motif, room, position FROM patients WHERE status='hospitalise' AND room IS NOT NULL"
+    ).fetchall()
+    rooms = {r: {"room": r, "beds": {"F": None, "P": None}} for r in ROOMS}
+    for p in rows:
+        if p["room"] in rooms and p["position"] in POSITIONS:
+            rooms[p["room"]]["beds"][p["position"]] = dict(p)
+    hs = db().execute(
+        "SELECT COUNT(*) FROM patients WHERE status='hospitalise' AND hors_service IS NOT NULL AND hors_service != ''"
+    ).fetchone()[0]
+    return jsonify(rooms=list(rooms.values()), hors_service_count=hs)
+
+
+@app.get("/api/hors-service")
+@login_required
+def api_hors_service():
+    rows = db().execute(
+        """SELECT id, nom, prenom, ip, motif, hors_service FROM patients
+           WHERE status='hospitalise' AND hors_service IS NOT NULL AND hors_service != ''
+           ORDER BY hors_service, nom"""
+    ).fetchall()
+    return jsonify(patients=[dict(r) for r in rows])
+
+
+@app.get("/api/archives")
+@login_required
+def api_archives():
+    q = (request.args.get("q") or "").strip()
+    sql = "SELECT id, nom, prenom, ip, motif, sortie_date, sortie_mode FROM patients WHERE status='sorti'"
+    args = []
+    if q:
+        sql += " AND (nom LIKE ? OR prenom LIKE ? OR ip LIKE ?)"
+        args = [f"%{q}%"] * 3
+    sql += " ORDER BY sortie_date DESC, id DESC LIMIT 300"
+    return jsonify(patients=[dict(r) for r in db().execute(sql, args).fetchall()])
+
+
+@app.get("/api/search")
+@login_required
+def api_search():
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 2:
+        return jsonify(patients=[])
+    rows = db().execute(
+        """SELECT id, nom, prenom, ip, motif, room, position, hors_service, status FROM patients
+           WHERE nom LIKE ? OR prenom LIKE ? OR ip LIKE ? ORDER BY status, nom LIMIT 20""",
+        [f"%{q}%"] * 3,
+    ).fetchall()
+    return jsonify(patients=[dict(r) for r in rows])
+
+
+PATIENT_FIELDS = ["nom", "prenom", "age", "ip", "mutuelle", "groupe", "motif", "room", "position",
+                  "hors_service", "date_entree"]
+
+
+def clean_patient_payload(data, existing_id=None):
+    out = {k: data.get(k) for k in PATIENT_FIELDS if k in data}
+    for k in ("nom", "prenom", "ip", "mutuelle", "groupe", "motif", "hors_service", "room", "position", "date_entree"):
+        if k in out and out[k] is not None:
+            out[k] = str(out[k]).strip()
+    if "nom" in out:
+        out["nom"] = out["nom"].upper()
+    if "age" in out:
+        try:
+            out["age"] = int(out["age"]) if str(out["age"]).strip() != "" else None
+        except ValueError:
+            raise ValueError("L'âge doit être un nombre.")
+    # Emplacement : soit chambre + lit, soit hors service
+    if out.get("hors_service"):
+        out["room"] = None
+        out["position"] = None
+    else:
+        if "hors_service" in out:
+            out["hors_service"] = None
+        room, pos = out.get("room"), out.get("position")
+        if room or pos:
+            if room not in ROOMS or pos not in POSITIONS:
+                raise ValueError("Chambre ou lit invalide.")
+            if bed_taken(room, pos, existing_id):
+                raise ValueError(f"Le lit {room}{pos} est déjà occupé.")
+    return out
+
+
+@app.post("/api/patients")
+@login_required
+def api_create_patient():
+    data = request.get_json(silent=True) or {}
+    try:
+        p = clean_patient_payload(data)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    if not p.get("nom") or not p.get("ip"):
+        return jsonify(error="Nom et IP sont obligatoires."), 400
+    if not p.get("room") and not p.get("hors_service"):
+        return jsonify(error="Choisissez un lit ou un service d'hébergement."), 400
+    p.setdefault("date_entree", platform_now().date().isoformat())
+    cols = list(p.keys()) + ["created_at"]
+    cur = db().execute(
+        f"INSERT INTO patients({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+        [*p.values(), now()],
+    )
+    pid = cur.lastrowid
+    where = f"chambre {p['room']}{p['position']}" if p.get("room") else f"hors service : {p['hors_service']}"
+    log(pid, "Admission", f"{p['nom']} {p.get('prenom', '')} - IP {p['ip']} - {where}")
+    db().commit()
+    return jsonify(id=pid), 201
+
+
+@app.get("/api/patients/<int:pid>")
+@login_required
+def api_get_patient(pid):
+    p = db().execute("SELECT * FROM patients WHERE id = ?", (pid,)).fetchone()
+    if not p:
+        return jsonify(error="Patient introuvable."), 404
+    rows = db().execute(
+        "SELECT * FROM entries WHERE patient_id = ? ORDER BY date DESC, id DESC", (pid,)
+    ).fetchall()
+    entries = {k: [] for k in ENTRY_KINDS}
+    for r in rows:
+        entries.setdefault(r["kind"], []).append(dict(r))
+    return jsonify(patient=dict(p), entries=entries)
+
+
+@app.put("/api/patients/<int:pid>")
+@login_required
+def api_update_patient(pid):
+    old = db().execute("SELECT * FROM patients WHERE id = ?", (pid,)).fetchone()
+    if not old:
+        return jsonify(error="Patient introuvable."), 404
+    data = request.get_json(silent=True) or {}
+    try:
+        p = clean_patient_payload(data, existing_id=pid)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    if not p:
+        return jsonify(ok=True)
+    changes = []
+    labels = {"nom": "Nom", "prenom": "Prénom", "age": "Âge", "ip": "IP", "mutuelle": "Mutuelle",
+              "groupe": "Groupe", "motif": "Motif", "room": "Chambre", "position": "Lit",
+              "hors_service": "Hors service", "date_entree": "Date d'entrée"}
+    for k, v in p.items():
+        if (old[k] or "") != (v or ""):
+            changes.append(f"{labels.get(k, k)} : {old[k] or '-'} → {v or '-'}")
+    db().execute(
+        f"UPDATE patients SET {', '.join(f'{k} = ?' for k in p)} WHERE id = ?", [*p.values(), pid]
+    )
+    if changes:
+        log(pid, "Modification du dossier", " | ".join(changes))
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/patients/<int:pid>/sortie")
+@login_required
+def api_sortie(pid):
+    p = db().execute("SELECT * FROM patients WHERE id = ?", (pid,)).fetchone()
+    if not p:
+        return jsonify(error="Patient introuvable."), 404
+    data = request.get_json(silent=True) or {}
+    fields = {k: (data.get(k) or "").strip() for k in
+              ("sortie_date", "sortie_mode", "sortie_destination", "sortie_resume", "sortie_ordonnance", "sortie_rdv")}
+    validate = bool(data.get("valider"))
+    if validate and (not fields["sortie_date"] or not fields["sortie_mode"]):
+        return jsonify(error="Date et mode de sortie obligatoires pour valider la sortie."), 400
+    sets = dict(fields)
+    if validate:
+        sets["status"] = "sorti"
+    db().execute(f"UPDATE patients SET {', '.join(f'{k} = ?' for k in sets)} WHERE id = ?", [*sets.values(), pid])
+    if validate:
+        where = f"chambre {p['room']}{p['position']}" if p["room"] else (p["hors_service"] or "-")
+        log(pid, "Sortie validée", f"{fields['sortie_mode']} le {fields['sortie_date']} - libère {where}")
+    else:
+        log(pid, "Fiche de sortie enregistrée (brouillon)", fields["sortie_mode"])
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/patients/<int:pid>/readmettre")
+@login_required
+def api_readmit(pid):
+    data = request.get_json(silent=True) or {}
+    try:
+        p = clean_patient_payload({k: data.get(k) for k in ("room", "position", "hors_service")}, existing_id=pid)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    if not p.get("room") and not p.get("hors_service"):
+        return jsonify(error="Choisissez un lit ou un service d'hébergement."), 400
+    db().execute(
+        "UPDATE patients SET status='hospitalise', room=?, position=?, hors_service=?, date_entree=? WHERE id=?",
+        (p.get("room"), p.get("position"), p.get("hors_service"), platform_now().date().isoformat(), pid),
+    )
+    log(pid, "Réadmission", f"{p.get('room') or ''}{p.get('position') or ''} {p.get('hors_service') or ''}".strip())
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/patients/<int:pid>")
+@admin_required
+def api_delete_patient(pid):
+    db().execute("DELETE FROM patients WHERE id = ?", (pid,))
+    log(None, "Suppression définitive d'un dossier", f"id {pid}")
+    db().commit()
+    return jsonify(ok=True)
+
+
+# -------------------------------------------------------------------- Entries
+ENTRY_FIELDS = ["category", "date", "title", "content", "details", "done"]
+
+
+def entry_summary(e):
+    txt = (e.get("title") or e.get("content") or "").replace("\n", " ")
+    bits = [e.get("category") or "", e.get("date") or "", txt[:120]]
+    return " - ".join(b for b in bits if b)
+
+
+@app.post("/api/patients/<int:pid>/entries")
+@login_required
+def api_add_entry(pid):
+    if not db().execute("SELECT 1 FROM patients WHERE id = ?", (pid,)).fetchone():
+        return jsonify(error="Patient introuvable."), 404
+    data = request.get_json(silent=True) or {}
+    kind = data.get("kind")
+    if kind not in ENTRY_KINDS:
+        return jsonify(error="Type d'entrée invalide."), 400
+    e = {k: data.get(k, "" if k != "done" else 0) for k in ENTRY_FIELDS}
+    e["done"] = 1 if e["done"] else 0
+    if not (str(e["content"]).strip() or str(e["title"]).strip()):
+        return jsonify(error="Le contenu est vide."), 400
+    t = now()
+    cur = db().execute(
+        """INSERT INTO entries(patient_id, kind, category, date, title, content, details, done, author,
+           created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (pid, kind, e["category"], e["date"], e["title"], e["content"], e["details"], e["done"],
+         g.user["full_name"], t, t),
+    )
+    log(pid, f"{KIND_LABEL[kind]} ajouté(e)", entry_summary(e))
+    db().commit()
+    return jsonify(id=cur.lastrowid), 201
+
+
+@app.put("/api/entries/<int:eid>")
+@login_required
+def api_update_entry(eid):
+    old = db().execute("SELECT * FROM entries WHERE id = ?", (eid,)).fetchone()
+    if not old:
+        return jsonify(error="Entrée introuvable."), 404
+    data = request.get_json(silent=True) or {}
+    upd = {k: data[k] for k in ENTRY_FIELDS if k in data}
+    if "done" in upd:
+        upd["done"] = 1 if upd["done"] else 0
+    if not upd:
+        return jsonify(ok=True)
+    upd["updated_at"] = now()
+    db().execute(f"UPDATE entries SET {', '.join(f'{k} = ?' for k in upd)} WHERE id = ?", [*upd.values(), eid])
+    merged = {**dict(old), **upd}
+    label = KIND_LABEL.get(old["kind"], old["kind"])
+    if set(upd) == {"done", "updated_at"}:
+        if old["kind"] == "consigne":
+            action = "Consigne validée" if upd["done"] else "Consigne remise à faire"
+        else:
+            action = f"{label} : statut modifié"
+    else:
+        action = f"{label} modifié(e)"
+    log(old["patient_id"], action, entry_summary(merged))
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/entries/<int:eid>")
+@login_required
+def api_delete_entry(eid):
+    old = db().execute("SELECT * FROM entries WHERE id = ?", (eid,)).fetchone()
+    if not old:
+        return jsonify(error="Entrée introuvable."), 404
+    db().execute("DELETE FROM entries WHERE id = ?", (eid,))
+    log(old["patient_id"], f"{KIND_LABEL.get(old['kind'], old['kind'])} supprimé(e)", entry_summary(dict(old)))
+    db().commit()
+    return jsonify(ok=True)
+
+
+# ------------------------------------------------------------- Video upload
+ALLOWED_VIDEO = {".mp4", ".webm", ".mov", ".m4v", ".ogg", ".jpg", ".jpeg", ".png"}
+
+
+@app.post("/api/patients/<int:pid>/upload")
+@login_required
+def api_upload(pid):
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify(error="Aucun fichier."), 400
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in ALLOWED_VIDEO:
+        return jsonify(error="Format non supporté (mp4, webm, mov, jpg, png)."), 400
+    name = f"{pid}_{secrets.token_hex(6)}_{secure_filename(f.filename)}"
+    f.save(os.path.join(UPLOAD_DIR, name))
+    t = now()
+    title = request.form.get("title") or f.filename
+    date = request.form.get("date") or platform_now().date().isoformat()
+    db().execute(
+        """INSERT INTO entries(patient_id, kind, category, date, title, content, details, done, author,
+           created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (pid, "video", "fichier", date, title, name, request.form.get("details", ""), 0, g.user["full_name"], t, t),
+    )
+    log(pid, "Vidéo ajoutée", title)
+    db().commit()
+    return jsonify(ok=True), 201
+
+
+@app.get("/api/files/<path:name>")
+@login_required
+def api_file(name):
+    return send_from_directory(UPLOAD_DIR, secure_filename(name))
+
+
+# ----------------------------------------------------------------------- Logs
+@app.get("/api/patients/<int:pid>/logs")
+@login_required
+def api_logs(pid):
+    rows = db().execute("SELECT * FROM logs WHERE patient_id = ? ORDER BY id DESC", (pid,)).fetchall()
+    return jsonify(logs=[dict(r) for r in rows])
+
+
+@app.get("/api/logs")
+@admin_required
+def api_all_logs():
+    rows = db().execute(
+        """SELECT l.*, p.nom, p.prenom, p.ip FROM logs l LEFT JOIN patients p ON p.id = l.patient_id
+           ORDER BY l.id DESC LIMIT 500"""
+    ).fetchall()
+    return jsonify(logs=[dict(r) for r in rows])
+
+
+# ---------------------------------------------------------------------- Users
+@app.get("/api/users")
+@admin_required
+def api_users():
+    rows = db().execute("SELECT id, username, full_name, role, active FROM users ORDER BY id").fetchall()
+    return jsonify(users=[dict(r) for r in rows])
+
+
+@app.post("/api/users")
+@admin_required
+def api_add_user():
+    d = request.get_json(silent=True) or {}
+    username = (d.get("username") or "").strip().lower()
+    if not username or not d.get("password") or not d.get("full_name"):
+        return jsonify(error="Identifiant, nom complet et mot de passe obligatoires."), 400
+    if d.get("role") not in ("admin", "medecin", "infirmier"):
+        return jsonify(error="Rôle invalide."), 400
+    try:
+        db().execute(
+            "INSERT INTO users(username, full_name, role, password_hash, must_change_password, initial_setup_pending) VALUES (?,?,?,?,1,1)",
+            (username, d["full_name"].strip(), d["role"], generate_password_hash(d["password"])),
+        )
+    except sqlite3.IntegrityError:
+        return jsonify(error="Cet identifiant existe déjà."), 400
+    log(None, "Utilisateur créé", f"{username} ({d['role']})")
+    db().commit()
+    return jsonify(ok=True), 201
+
+
+@app.put("/api/users/<int:uid>")
+@admin_required
+def api_update_user(uid):
+    d = request.get_json(silent=True) or {}
+    db().execute("BEGIN IMMEDIATE")
+    u = db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        return jsonify(error="Utilisateur introuvable."), 404
+    if u["role"] == "admin" and "active" in d and not d["active"]:
+        return jsonify(error="Impossible de désactiver un compte administrateur."), 403
+    if u["role"] == "admin" and "role" in d and d["role"] != "admin":
+        return jsonify(error="Le rôle administrateur est protégé contre la rétrogradation."), 403
+    sets, args = [], []
+    if d.get("password"):
+        if len(d["password"]) < 8:
+            return jsonify(error="Le mot de passe doit contenir au moins 8 caractères."), 400
+        sets.append("password_hash=?"); args.append(generate_password_hash(d["password"]))
+        db().execute("DELETE FROM tokens WHERE user_id=?", (uid,))
+    if "active" in d:
+        sets.append("active=?"); args.append(1 if d["active"] else 0)
+        if not d["active"]:
+            db().execute("DELETE FROM tokens WHERE user_id=?", (uid,))
+    if d.get("role") in ("admin", "medecin", "infirmier"):
+        sets.append("role=?"); args.append(d["role"])
+    if sets:
+        db().execute(f"UPDATE users SET {', '.join(sets)} WHERE id=?", [*args, uid])
+        log(None, "Utilisateur modifié", f"id {uid}")
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/users/<int:uid>")
+@admin_required
+def api_delete_user(uid):
+    db().execute("BEGIN IMMEDIATE")
+    u = db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        return jsonify(error="Utilisateur introuvable."), 404
+    if u["role"] == "admin":
+        return jsonify(error="Impossible de supprimer un compte administrateur."), 403
+    db().execute("DELETE FROM users WHERE id=?", (uid,))
+    log(None, "Utilisateur supprimé", f"{u['username']} — {u['full_name']} (id {uid})")
+    db().commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/clock")
+@login_required
+def api_clock():
+    row = db().execute("SELECT offset_minutes FROM clock_settings WHERE id=1").fetchone()
+    return jsonify(timezone="UTC", offset_minutes=row[0], epoch_ms=dt.datetime.now(dt.timezone.utc).timestamp()*1000)
+
+
+@app.put("/api/clock")
+@admin_required
+def api_set_clock():
+    d = request.get_json(silent=True) or {}
+    try:
+        offset = int(d.get("offset_minutes", 0))
+        if not -1440 <= offset <= 1440:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return jsonify(error="Correction invalide : -1440 à 1440 minutes."), 400
+    db().execute("UPDATE clock_settings SET timezone='UTC', offset_minutes=? WHERE id=1", (offset,))
+    db().commit()
+    log(None, "Réglage de l'horloge UTC", f"Correction {offset} minutes")
+    db().commit()
+    return api_clock()
+
+
+@app.put("/api/me/profile")
+@login_required
+def api_profile():
+    d = request.get_json(silent=True) or {}
+    if not check_password_hash(g.user["password_hash"], d.get("current_password") or ""):
+        return jsonify(error="Mot de passe actuel incorrect."), 400
+    password = d.get("password") or ""
+    if password and not g.user["initial_setup_pending"]:
+        return jsonify(error="Après la première connexion, seul l'administrateur peut modifier votre mot de passe."), 403
+    if g.user["initial_setup_pending"] and (len(password)<8 or check_password_hash(g.user["password_hash"], password)):
+        return jsonify(error="Choisissez un mot de passe différent de 8 caractères minimum."), 400
+    username = str(d.get("username", g.user["username"])).strip().lower()
+    name = str(d.get("full_name", g.user["full_name"])).strip()
+    if not username or not name or len(username)>80 or len(name)>160:
+        return jsonify(error="Identifiant et nom complet valides obligatoires."), 400
+    try:
+        db().execute("UPDATE users SET username=?, full_name=?, password_hash=?, must_change_password=0, initial_setup_pending=0 WHERE id=?",
+                     (username, name, generate_password_hash(password) if password else g.user["password_hash"], g.user["id"]))
+    except sqlite3.IntegrityError:
+        return jsonify(error="Cet identifiant existe déjà."), 400
+    token = request.headers.get("Authorization", "")[7:]
+    db().execute("DELETE FROM tokens WHERE user_id=? AND token<>?", (g.user["id"], token))
+    log(None, "Compte personnalisé", f"id {g.user['id']} : {username}")
+    db().commit()
+    return jsonify(user=user_public(db().execute("SELECT * FROM users WHERE id=?", (g.user["id"],)).fetchone()))
+
+
+# ---------------------------------------------------------------- Front-end
+@app.get("/")
+def index():
+    return send_from_directory(app.static_folder, "index.html")
+
+
+@app.after_request
+def no_cache_api(resp):
+    if request.path.startswith("/api/"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+init_db()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), debug=False)

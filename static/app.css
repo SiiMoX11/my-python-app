@@ -246,3 +246,65 @@ table.tbl tr.clickable:hover td{background:#f6f9fc}
   .topbar,.tabsbar,.no-print{display:none!important}
   .patient{height:auto}
 }
+
+/* MODIFICATION MAJ PAR CRAYON */
+.maj-read-only { cursor: default !important; }
+.maj-edit-pencil { float: right; display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; margin: 0 0 4px 6px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; color: #334155; font-size: 21px; line-height: 1; cursor: pointer; }
+.maj-edit-pencil:hover { background: #eef2ff; border-color: #64748b; }
+.maj-edit-pencil:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+
+/* CRAYON MAJ COMPACT — V2 */
+.maj-edit-pencil {
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  min-height: 20px;
+  margin: 0 0 2px 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #64748b;
+  font-size: 15px;
+  line-height: 1;
+  box-shadow: none;
+  opacity: .5;
+  transition: opacity .15s ease, background-color .15s ease;
+}
+.maj-read-only:hover > .maj-edit-pencil,
+.maj-edit-pencil:hover,
+.maj-edit-pencil:focus-visible {
+  opacity: 1;
+}
+.maj-edit-pencil:hover,
+.maj-edit-pencil:focus-visible {
+  background: #f1f5f9;
+  color: #334155;
+}
+.maj-edit-pencil:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+@media (pointer: coarse) {
+  .maj-edit-pencil {
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    min-height: 24px;
+    opacity: .75;
+  }
+}
+
+/* MAJ : ETIQUETTES CLINIQUES DISCRETES V3 */
+#tab-content [data-eid^="clinique:"] .cat-tag {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+  color: #64748b;
+  background: #f1f5f9;
+  padding: 1px 5px;
+  border-radius: 4px;
+  margin-bottom: 3px;
+  line-height: 1.35;
+}
