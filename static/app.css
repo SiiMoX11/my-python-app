@@ -308,3 +308,244 @@ table.tbl tr.clickable:hover td{background:#f6f9fc}
   margin-bottom: 3px;
   line-height: 1.35;
 }
+
+/* Bilans simples V2 : ne modifie pas maj-edit-pencil */
+.bilan-simple{white-space:normal}
+.simple-dates{font-weight:700;font-size:12px;margin-bottom:9px;overflow-wrap:anywhere;padding-right:20px}
+.simple-line{font-size:12px;line-height:1.8;overflow-wrap:anywhere}
+.simple-label{font-weight:600}
+.simple-arrow{color:#000;font-weight:600;padding:0 2px}
+.simple-form{display:flex;flex-direction:column;gap:7px}
+.simple-form-row{display:grid;grid-template-columns:1fr;gap:8px}
+.simple-form-row.pair{grid-template-columns:1fr 1fr}
+.simple-field{font-size:12px;color:#475569}
+.simple-field input,.simple-field textarea{display:block;width:100%;box-sizing:border-box;padding:8px;font-size:14px}
+.simple-note{font-size:11px;color:#64748b;margin:8px 0;line-height:1.5}
+.simple-picker{display:block;margin-bottom:10px;font-size:12px}
+.simple-picker select{display:block;width:100%;padding:7px}
+.simple-bilan-dialog{width:min(520px,94vw)!important}
+
+/* BILANS VISUELS V5 — fichiers complets */
+.simple-bilan-dialog input:focus,
+.simple-bilan-dialog textarea:focus,
+.simple-bilan-dialog select:focus {
+  border-color: #94a3b8 !important;
+  outline: none !important;
+  box-shadow: none !important;
+}
+.simple-bilan-dialog input:focus-visible,
+.simple-bilan-dialog textarea:focus-visible,
+.simple-bilan-dialog select:focus-visible {
+  outline: 1px solid #94a3b8 !important;
+  outline-offset: 0 !important;
+}
+.simple-bilan-dialog .fgrid { margin-bottom: 12px; }
+.bilan-recent-yellow {
+  background: #fff59d;
+  padding: 1px 3px;
+  border-radius: 2px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+/* BILANS V7 — ROUGE UNIQUEMENT SUR LE DERNIER BILAN */
+#tab-content .lab-abnormal {
+  color: #000000 !important;
+  font-weight: 400 !important;
+}
+#tab-content .simple-line {
+  color: #000000;
+}
+#tab-content .simple-line span:not(.simple-label) {
+  color: #000000 !important;
+}
+#tab-content .bilan-recent-yellow {
+  background: #fff59d;
+  color: #000000 !important;
+  font-weight: 700 !important;
+}
+#tab-content .bilan-recent-yellow span {
+  color: #000000 !important;
+  font-weight: 700 !important;
+}
+#tab-content .bilan-recent-yellow .lab-abnormal,
+#tab-content .simple-line .bilan-recent-yellow .lab-abnormal {
+  color: #c81e1e !important;
+  font-weight: 700 !important;
+}
+
+/* OBSRV DOCUMENTS V1 */
+.obs-doc-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;min-height:0;height:100%;align-items:start}
+.obs-doc-grid>.panel{min-width:0;max-height:100%;overflow:auto}
+.obs-doc-grid .panel-head{flex-wrap:wrap;gap:8px}
+.obs-doc-note{font-size:12px;color:#64748b;line-height:1.5;margin:8px 0 14px}
+.patient-doc-card{display:flex;width:100%;align-items:center;gap:10px;padding:12px;margin-bottom:9px;text-align:left;border:1px solid #e2e8f0;border-radius:9px;background:#fff;color:#334155;cursor:pointer}
+.patient-doc-card:hover{background:#f8fafc;border-color:#94a3b8}
+.patient-doc-card>span:nth-child(2){min-width:0;flex:1;overflow-wrap:anywhere}
+.patient-doc-card small{display:block;margin-top:4px;color:#64748b;font-size:11px}
+.doc-format{font-size:10px;font-weight:600;color:#475569;background:#f1f5f9;border-radius:4px;padding:4px}
+.doc-open-label{font-size:11px;color:#64748b}
+.document-preview-dialog{width:min(1100px,96vw)!important;max-width:96vw!important;height:90vh;display:flex;flex-direction:column;overflow:hidden}
+.document-preview-content{flex:1;min-height:0;overflow:auto;padding:12px}
+.patient-doc-frame{display:block;width:100%;height:calc(100% - 35px);min-height:300px;border:0;background:white}
+.patient-doc-image{display:block;max-width:100%;height:auto;margin:auto}
+@media(max-width:900px){.obs-doc-grid{grid-template-columns:1fr;height:auto}.obs-doc-grid>.panel{max-height:none}}
+
+/* DOCUMENTS PDF V2 */
+.doc-preview-actions{display:flex;gap:8px;align-items:center}
+.document-preview-dialog .dialog-head h2{min-width:0;overflow-wrap:anywhere}
+.pdf-local-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.pdf-local-toolbar [data-page-label]{font-size:12px;color:#475569}
+.pdf-local-toolbar [data-zoom-label]{font-size:11px;color:#64748b}
+.pdf-local-stage{background:#e2e8f0;padding:12px;overflow:auto;height:calc(100% - 65px);min-height:250px}
+.pdf-local-image{display:block;max-width:none;height:auto;margin:0 auto;box-shadow:0 1px 5px #64748b}
+
+/* TRAITEMENTS TTT V1 */
+.ttt-head-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.ttt-diseases{display:grid;grid-template-columns:1fr auto;gap:7px;align-items:end;margin:12px 0 20px}
+.ttt-diseases label{grid-column:1/-1;font-size:12px;font-weight:600;color:#475569}
+.ttt-diseases textarea{width:100%;box-sizing:border-box;padding:9px;border:1px solid #cbd5e1;border-radius:6px;font:inherit;font-size:13px}
+.ttt-note{font-size:11px;color:#64748b;line-height:1.5;margin:0 0 12px}
+@media(max-width:600px){.ttt-diseases{grid-template-columns:1fr}.ttt-head-actions{width:100%}}
+
+/* TTT PRESENTATION V3 */
+.ttt-diseases{grid-template-columns:minmax(170px,420px) auto;justify-content:start;align-items:center;gap:6px;margin:8px 0 12px}
+.ttt-diseases textarea{min-height:32px;height:32px;max-height:70px;padding:6px 8px;font-size:12px;resize:vertical;line-height:1.3}
+.ttt-diseases label{font-size:11px}
+.ttt-preview-dialog{width:min(1050px,96vw)!important;max-width:96vw!important;height:92vh;display:flex;flex-direction:column;overflow:hidden}
+.ttt-preview-actions{display:flex;gap:8px;align-items:center}
+.ttt-preview-content{flex:1;min-height:0;overflow:auto}
+.ttt-preview-frame{display:block;width:100%;height:100%;border:0;background:#e2e8f0}
+@media(max-width:600px){.ttt-diseases{grid-template-columns:1fr}.ttt-preview-dialog .dialog-head{flex-wrap:wrap;gap:8px}}
+
+/* VIDEOS IMAGERIES V1 */
+.imaging-card{cursor:pointer}
+.imaging-card-head{display:flex;align-items:start;justify-content:space-between;gap:8px}
+.imaging-card-head h4{margin:0;overflow-wrap:anywhere}
+.imaging-open{width:100%;margin:12px 0 8px;padding:20px 10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;color:#475569;font:inherit;font-size:13px;cursor:pointer}
+.imaging-open:hover{background:#eef2f6}
+.imaging-summary{font-size:11px;color:#64748b;margin:4px 0}
+.imaging-description{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.imaging-player-dialog{width:min(1000px,96vw)!important;max-width:96vw!important;max-height:92vh;overflow:auto}
+.imaging-player-content{padding:12px;min-height:200px;text-align:center;background:#f8fafc}
+.imaging-player-video{display:block;width:100%;max-height:68vh;background:#000;margin:auto}
+.imaging-player-image{display:block;max-width:100%;max-height:68vh;object-fit:contain;margin:auto}
+.imaging-youtube-frame{width:100%;height:65vh;min-height:300px;border:0}
+.imaging-player-meta,.imaging-player-description{padding:8px 16px;margin:0;font-size:12px;color:#64748b;white-space:pre-wrap}
+.imaging-format-note{font-size:12px;color:#64748b}
+
+/* MINIATURES IMAGERIES V2 */
+.imaging-card[data-imaging-type="TDM"]{background:#eff6ff;border:1px solid #bfdbfe}
+.imaging-card[data-imaging-type="IRM"]{background:#f0fdf4;border:1px solid #bbf7d0}
+.imaging-card[data-imaging-type="Autre"]{background:#fff7ed;border:1px solid #fed7aa}
+.imaging-subtitle{font-size:12px;color:#475569;margin:5px 0 10px}
+.imaging-thumbnail{display:block;position:relative;width:100%;aspect-ratio:16/9;overflow:hidden;padding:0;border:1px solid #cbd5e1;border-radius:8px;background:#e2e8f0;color:#475569;cursor:pointer}
+.imaging-thumbnail-media{display:block;width:100%;height:100%;object-fit:cover;pointer-events:none}
+.imaging-thumbnail-play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:10px 15px;border-radius:50%;background:rgba(15,23,42,.65);color:white;font-size:22px;pointer-events:none}
+.imaging-thumbnail-fallback{display:block;font-size:30px;line-height:1.8}
+.imaging-thumbnail small{display:block;padding:6px;font-size:11px}
+.imaging-card[data-imaging-type="TDM"] .imaging-thumbnail{border-color:#93c5fd}
+.imaging-card[data-imaging-type="IRM"] .imaging-thumbnail{border-color:#86efac}
+.imaging-card[data-imaging-type="Autre"] .imaging-thumbnail{border-color:#fdba74}
+
+/* DATE IMAGERIE PLUS VISIBLE V3 */
+.imaging-card .imaging-subtitle {
+  font-size: 14px;
+  font-weight: 700;
+  color: #334155;
+  line-height: 1.4;
+  margin: 6px 0 12px;
+}
+
+/* ESPACEMENT DESCRIPTION IMAGERIE V3 */
+.imaging-card .imaging-description {
+  margin: 16px 0 8px;
+  line-height: 1.5;
+}
+.imaging-reader-actions { display:flex; gap:8px; align-items:center; }
+.imaging-player-dialog .dialog-head h2 { min-width:0; overflow-wrap:anywhere; }
+
+/* ONGLETS PATIENT CENTRES ET DYNAMIQUES V1 */
+#pmain > .tabsbar {
+  display: grid;
+  grid-template-columns: minmax(0,1fr);
+  align-items: center;
+  row-gap: 10px;
+}
+#pmain > .tabsbar > .btn-back {
+  justify-self: start;
+  width: auto;
+}
+#pmain > .tabsbar > .tabs {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  flex: none;
+  grid-template-columns: none;
+}
+#pmain > .tabsbar > .tabs > .tab {
+  flex: 0 1 auto;
+  width: auto;
+  max-width: 100%;
+}
+
+/* CORRECTION ONGLETS MEME LIGNE ET GRANDE TAILLE V2 */
+#pmain > .tabsbar {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 12px;
+  grid-template-columns: none;
+}
+#pmain > .tabsbar > .btn-back {
+  flex: 0 0 auto;
+  width: auto;
+  justify-self: auto;
+}
+#pmain > .tabsbar > .tabs {
+  display: flex;
+  flex: 1 1 0;
+  flex-wrap: nowrap;
+  justify-content: center;
+  align-items: stretch;
+  gap: 10px;
+  width: auto;
+  min-width: 0;
+  overflow-x: auto;
+  grid-template-columns: none;
+  padding: 2px 0;
+}
+#pmain > .tabsbar > .tabs > .tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1 0 115px;
+  width: auto;
+  min-width: 115px;
+  max-width: none;
+  min-height: 50px;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  font-size: 18px;
+  font-weight: 600;
+  text-align: center;
+  line-height: 1.2;
+  white-space: normal;
+}
+@media (max-width: 900px) {
+  #pmain > .tabsbar { gap: 8px; }
+  #pmain > .tabsbar > .btn-back { font-size: 14px; padding: 9px 12px; }
+  #pmain > .tabsbar > .tabs { gap: 7px; justify-content: flex-start; }
+  #pmain > .tabsbar > .tabs > .tab {
+    flex-basis: 105px;
+    min-width: 105px;
+    min-height: 46px;
+    font-size: 16px;
+    padding: 9px 10px;
+  }
+}

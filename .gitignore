@@ -1,5 +1,20 @@
+# Donnees (patients) : ne jamais pousser sur GitHub
 cva.db
+cva.db-*
 uploads/
+Tableau_service_*.docx
+
+# Sauvegardes creees par les scripts d'adaptation
+*.bak
+
+# Python / environnements
+__pycache__/
+*.pyc
+venv/
+.venv/
+.env
+
+# Divers
 dist/
 server.log
-__pycache__/
+CVA_archive_*/

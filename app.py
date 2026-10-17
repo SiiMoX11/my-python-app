@@ -505,6 +505,25 @@ def api_sortie(pid):
     fields = {k: (data.get(k) or "").strip() for k in
               ("sortie_date", "sortie_mode", "sortie_destination", "sortie_resume", "sortie_ordonnance", "sortie_rdv")}
     validate = bool(data.get("valider"))
+    # Admission date is editable from SORTIE without clearing it for older clients.
+    if "date_entree" in data:
+        raw_entry=data.get("date_entree")
+        if raw_entry is not None and not isinstance(raw_entry,str):
+            return jsonify(error="Date d’entrée invalide."),400
+        fields["date_entree"]=(raw_entry or "").strip()
+    entry_date=fields.get("date_entree",p["date_entree"] or "")
+    exit_date=fields["sortie_date"]
+    try:
+        admission=dt.date.fromisoformat(entry_date) if entry_date else None
+        discharge=dt.date.fromisoformat(exit_date) if exit_date else None
+    except ValueError:
+        return jsonify(error="Date d’entrée ou de sortie invalide."),400
+    if admission and discharge and discharge<admission:
+        return jsonify(error="La date de sortie ne peut pas précéder la date d’entrée."),400
+    if validate and not admission:
+        return jsonify(error="Renseignez la date d’entrée avant de valider la sortie."),400
+    if "date_entree" in fields and (p["date_entree"] or "")!=entry_date:
+        log(pid,"Date d’entrée modifiée depuis SORTIE",str(p["date_entree"] or "-")+" → "+entry_date)
     if validate and (not fields["sortie_date"] or not fields["sortie_mode"]):
         return jsonify(error="Date et mode de sortie obligatoires pour valider la sortie."), 400
     sets = dict(fields)
@@ -659,7 +678,7 @@ def api_file(name):
 
 # ----------------------------------------------------------------------- Logs
 @app.get("/api/patients/<int:pid>/logs")
-@login_required
+@admin_required
 def api_logs(pid):
     rows = db().execute("SELECT * FROM logs WHERE patient_id = ? ORDER BY id DESC", (pid,)).fetchall()
     return jsonify(logs=[dict(r) for r in rows])
@@ -814,9 +833,31 @@ def no_cache_api(resp):
     return resp
 
 
+from bilans_tools import register_bilans
+register_bilans(app, db, login_required, now, log)
+
 # EXTENSION TABLEAU WORD
 from tableau_word import register_tableau
 register_tableau(app, db, login_required, now)
+
+# OBSRV DOCUMENTS V1
+from documents_obsrv import register_documents
+register_documents(app, db, login_required, now, log, DB_PATH, UPLOAD_DIR)
+from document_pdf_routes import register_document_pdf_routes
+register_document_pdf_routes(app, db, login_required, UPLOAD_DIR)
+
+# TRAITEMENTS TTT V1
+from traitements_ttt import register_treatments
+register_treatments(app, db, login_required, now, log, DB_PATH)
+from ttt_preview import register_ttt_preview
+register_ttt_preview(app, db, login_required, now)
+
+# VIDEOS IMAGERIES V1
+from videos_imageries import register_imaging
+register_imaging(app, db, login_required, DB_PATH, UPLOAD_DIR, now, log)
+
+from sortie_documents import register_sortie_documents
+register_sortie_documents(app, db, login_required)
 
 init_db()
 
